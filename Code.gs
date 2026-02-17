@@ -83,12 +83,10 @@ function readState_(docId) {
     const content = file.getBlob().getDataAsString()
     const state = JSON.parse(content)
     
-    // Load tagChildren from temp file if in writing phase
-    if (state.phase === 'writing') {
-      const tempFile = getTempDataFile_(docId)
-      if (tempFile) {
-        state.tagChildrenData = deserializeTagChildren_(tempFile)
-      }
+    // Load tagChildren from temp file for both gathering and writing phases
+    const tempFile = getTempDataFile_(docId)
+    if (tempFile) {
+      state.tagChildrenData = deserializeTagChildren_(tempFile)
     }
     
     return state
@@ -344,7 +342,13 @@ function findTagsAndBuildIndex() {
   } else {
     // Ensure all required properties exist when resuming
     if (!state.currentTagMatches) state.currentTagMatches = []
-    if (!state.tagChildren) state.tagChildren = {}
+    
+    // Restore tagChildren from loaded data if available
+    if (state.tagChildrenData) {
+      state.tagChildren = state.tagChildrenData
+    } else if (!state.tagChildren) {
+      state.tagChildren = {}
+    }
   }
   
   try {
