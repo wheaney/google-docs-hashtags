@@ -40,7 +40,7 @@ const TAGS_SECTION_NAME = "Tags"
 const MAX_CHARS_PER_ENTRY = 150
 const ELLIPSIS = "..."
 const SAVE_THRESHOLD = 100
-const MAX_RUNTIME_MS = 4.5 * 60 * 1000 // 4.5 minutes (save earlier to account for serialization time)
+const MAX_RUNTIME_MS = 4.5 * 60 * 1000 // 4.5 minutes in milliseconds (save early to allow time for state serialization)
 const STATE_FILE_PREFIX = "hashtag_indexing_state"
 const TEMP_DATA_PREFIX = "hashtag_temp_data"
 
@@ -100,30 +100,27 @@ function readState_(docId) {
 function serializeElement_(element) {
   // Convert Document element to lightweight serializable format
   const elementType = element.getType()
+  const typeString = elementType.toString()
   const serialized = {
-    type: elementType.toString()
+    type: typeString
   }
   
-  switch (elementType) {
-    case DocumentApp.ElementType.PARAGRAPH:
-      const para = element.asParagraph()
-      serialized.text = para.getText()
-      serialized.heading = para.getHeading().toString()
-      break
-    case DocumentApp.ElementType.LIST_ITEM:
-      const listItem = element.asListItem()
-      serialized.text = listItem.getText()
-      serialized.glyphType = listItem.getGlyphType().toString()
-      break
-    case DocumentApp.ElementType.INLINE_IMAGE:
-      // Store image as base64 to avoid slow Docs API calls
-      const img = element.asInlineImage()
-      serialized.blob = Utilities.base64Encode(img.getBlob().getBytes())
-      serialized.width = img.getWidth()
-      serialized.height = img.getHeight()
-      break
-    default:
-      serialized.text = element.getText ? element.getText() : ''
+  if (typeString === 'PARAGRAPH') {
+    const para = element.asParagraph()
+    serialized.text = para.getText()
+    serialized.heading = para.getHeading().toString()
+  } else if (typeString === 'LIST_ITEM') {
+    const listItem = element.asListItem()
+    serialized.text = listItem.getText()
+    serialized.glyphType = listItem.getGlyphType().toString()
+  } else if (typeString === 'INLINE_IMAGE') {
+    // Store image as base64 to avoid slow Docs API calls
+    const img = element.asInlineImage()
+    serialized.blob = Utilities.base64Encode(img.getBlob().getBytes())
+    serialized.width = img.getWidth()
+    serialized.height = img.getHeight()
+  } else {
+    serialized.text = element.getText ? element.getText() : ''
   }
   
   return serialized
@@ -564,7 +561,7 @@ function writingPhase_(doc, state, startTime, docId) {
         
         if (isDeserialized) {
           // Element was loaded from state - use serialized data
-          if (child.serializedType.includes('INLINE_IMAGE')) {
+          if (child.serializedType === 'INLINE_IMAGE') {
             if (child.imageBlob) {
               const imageBlob = Utilities.newBlob(Utilities.base64Decode(child.imageBlob))
               const image = body.appendImage(imageBlob)
@@ -573,7 +570,7 @@ function writingPhase_(doc, state, startTime, docId) {
             }
           } else {
             const truncated = truncateText_(child.text.replace(TAGS_REGEX, ''), MAX_CHARS_PER_ENTRY)
-            if (child.serializedType.includes('LIST_ITEM')) {
+            if (child.serializedType === 'LIST_ITEM') {
               body.appendListItem(truncated)
             } else {
               body.appendParagraph(truncated)
