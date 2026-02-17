@@ -8,7 +8,7 @@
 // implements a resumable execution model:
 //
 // 1. Two phases: GATHERING (collect hashtags) and WRITING (build Tags section)
-// 2. Runtime is tracked; after ~4.5 minutes, state is saved and execution stops
+// 2. Runtime is tracked; after ~5.5 minutes, state is saved and execution stops
 // 3. State is stored in:
 //    - JSON file in Drive: tracks phase and progress indices
 //    - JSON data file in Drive: stores collected tagChildren as lightweight JSON
@@ -29,7 +29,8 @@
 // - On resume, continues from saved indices
 //
 // PERFORMANCE NOTES:
-// - MAX_RUNTIME_MS set to 4.5 minutes to allow time for state serialization
+// - MAX_RUNTIME_MS set to 5.5 minutes (allows safe margin before 6-minute timeout)
+// - Document saved before state file to ensure state file timestamp is more recent
 // - JSON blob serialization is much faster than Docs API writes
 // - Document elements converted to lightweight format (text + metadata only)
 //
@@ -40,7 +41,7 @@ const TAGS_SECTION_NAME = "Tags"
 const MAX_CHARS_PER_ENTRY = 150
 const ELLIPSIS = "..."
 const SAVE_THRESHOLD = 100
-const MAX_RUNTIME_MS = 4.5 * 60 * 1000 // 4.5 minutes in milliseconds (save early to allow time for state serialization)
+const MAX_RUNTIME_MS = 5.5 * 60 * 1000 // 5.5 minutes in milliseconds
 const STATE_FILE_PREFIX = "hashtag_indexing_state"
 const TEMP_DATA_PREFIX = "hashtag_temp_data"
 
@@ -230,17 +231,12 @@ function shouldResumeFromState_(docId) {
   const docLastModified = docFile.getLastUpdated()
   const stateLastModified = file.getLastUpdated()
   
-  // The document gets saved when we checkpoint state, so it will be slightly newer than state file
-  // Resume if state file is recent (within 1 minute of doc modification)
-  // Don't resume if document was modified significantly after state was saved (user made changes)
-  const timeDiff = Math.abs(docLastModified.getTime() - stateLastModified.getTime())
-  const oneMinute = 60 * 1000
-  
   Logger.log('State file timestamp: ' + stateLastModified)
   Logger.log('Doc last modified: ' + docLastModified)
-  Logger.log('Time difference (ms): ' + timeDiff)
   
-  return timeDiff < oneMinute
+  // Resume if state file is more recent than the document
+  // This means we checkpointed after the last document modification
+  return stateLastModified > docLastModified
 }
 
 function truncateText_(text, maxLength) {
@@ -389,9 +385,10 @@ function gatheringPhase_(doc, state, startTime, docId) {
     // (currentTagMatches tracks in-progress multi-line tag collections)
     if (Date.now() - startTime > MAX_RUNTIME_MS && state.currentTagMatches.length === 0) {
       state.childIndex = childIndex
-      writeState_(docId, state, state.tagChildren)
       doc.saveAndClose()
-      Logger.log('Saved gathering phase state at child index: ' + childIndex)
+      writeState_(docId, state, state.tagChildren)
+      const progress = Math.round((childIndex / totalChildren) * 100)
+      Logger.log('Saved gathering phase state at child ' + childIndex + '/' + totalChildren + ' (' + progress + '% complete)')
       return state
     }
     
@@ -521,9 +518,10 @@ function writingPhase_(doc, state, startTime, docId) {
     // Check if we're approaching the time limit
     if (Date.now() - startTime > MAX_RUNTIME_MS) {
       state.currentTagIndex = tagIndex
-      writeState_(docId, state, null) // Don't re-save tagChildren, just state
       doc.saveAndClose()
-      Logger.log('Saved writing phase state at tag index: ' + tagIndex)
+      writeState_(docId, state, null) // Don't re-save tagChildren, just state
+      const progress = Math.round((tagIndex / state.sortedTags.length) * 100)
+      Logger.log('Saved writing phase state at tag ' + (tagIndex + 1) + '/' + state.sortedTags.length + ' (' + progress + '% complete)')
       return state
     }
     
@@ -546,9 +544,10 @@ function writingPhase_(doc, state, startTime, docId) {
       if (Date.now() - startTime > MAX_RUNTIME_MS) {
         state.currentTagIndex = tagIndex
         state.currentTagChildIndex = childIdx
-        writeState_(docId, state, null) // Don't re-save tagChildren, just state
         doc.saveAndClose()
-        Logger.log('Saved writing phase state at tag: ' + tag + ', child: ' + childIdx)
+        writeState_(docId, state, null) // Don't re-save tagChildren, just state
+        const tagProgress = Math.round((tagIndex / state.sortedTags.length) * 100)
+        Logger.log('Saved writing phase state at tag ' + (tagIndex + 1) + '/' + state.sortedTags.length + ', entry ' + (childIdx + 1) + '/' + reversedChildren.length + ' (' + tagProgress + '% of tags complete)')
         return state
       }
       
