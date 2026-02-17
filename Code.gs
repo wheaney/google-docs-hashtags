@@ -8,24 +8,30 @@
 // implements a resumable execution model:
 //
 // 1. Two phases: GATHERING (collect hashtags) and WRITING (build Tags section)
-// 2. Runtime is tracked; after ~5 minutes, state is saved and execution stops
+// 2. Runtime is tracked; after ~4.5 minutes, state is saved and execution stops
 // 3. State is stored in:
 //    - JSON file in Drive: tracks phase and progress indices
-//    - Temporary Doc in Drive: stores collected tagChildren data (can't serialize to JSON)
+//    - JSON data file in Drive: stores collected tagChildren as lightweight JSON
+//      (much faster than Docs API - elements serialized to text/metadata)
 // 4. On next run, if state file is newer than document, execution resumes
 // 5. On successful completion, state files are cleaned up
 //
 // GATHERING PHASE:
 // - Iterates through document children, tracking childIndex
 // - Collects hashtags and associated content into tagChildren structure
-// - If time limit reached, saves state (including tagChildren to temp doc) and exits
+// - If time limit reached, saves state (serializing tagChildren to JSON) and exits
 // - On resume, continues from saved childIndex
 //
 // WRITING PHASE:
 // - Iterates through collected tags, tracking currentTagIndex and currentTagChildIndex
 // - Writes tag sections to the document
-// - If time limit reached, saves state and exits (tagChildren already in temp doc)
+// - If time limit reached, saves state and exits (tagChildren already in JSON file)
 // - On resume, continues from saved indices
+//
+// PERFORMANCE NOTES:
+// - MAX_RUNTIME_MS set to 4.5 minutes to allow time for state serialization
+// - JSON blob serialization is much faster than Docs API writes
+// - Document elements converted to lightweight format (text + metadata only)
 //
 
 const TAGS_REGEX_STRING = "#[^\\s]+"
@@ -34,9 +40,9 @@ const TAGS_SECTION_NAME = "Tags"
 const MAX_CHARS_PER_ENTRY = 150
 const ELLIPSIS = "..."
 const SAVE_THRESHOLD = 100
-const MAX_RUNTIME_MS = 5 * 60 * 1000 // 5 minutes
+const MAX_RUNTIME_MS = 4.5 * 60 * 1000 // 4.5 minutes (save earlier to account for serialization time)
 const STATE_FILE_PREFIX = "hashtag_indexing_state"
-const TEMP_DOC_PREFIX = "hashtag_temp_data"
+const TEMP_DATA_PREFIX = "hashtag_temp_data"
 
 function getStateFile_(docId) {
   const fileName = `${STATE_FILE_PREFIX}_${docId}.json`
@@ -47,11 +53,11 @@ function getStateFile_(docId) {
   return null
 }
 
-function getTempDataDoc_(docId) {
-  const docName = `${TEMP_DOC_PREFIX}_${docId}`
-  const files = DriveApp.getFilesByName(docName)
+function getTempDataFile_(docId) {
+  const fileName = `${TEMP_DATA_PREFIX}_${docId}.json`
+  const files = DriveApp.getFilesByName(fileName)
   if (files.hasNext()) {
-    return DocumentApp.openById(files.next().getId())
+    return files.next()
   }
   return null
 }
@@ -62,9 +68,10 @@ function createStateFile_(docId) {
   return DriveApp.createFile(blob)
 }
 
-function createTempDataDoc_(docId) {
-  const docName = `${TEMP_DOC_PREFIX}_${docId}`
-  return DocumentApp.create(docName)
+function createTempDataFile_(docId) {
+  const fileName = `${TEMP_DATA_PREFIX}_${docId}.json`
+  const blob = Utilities.newBlob('{}', 'application/json', fileName)
+  return DriveApp.createFile(blob)
 }
 
 function readState_(docId) {
@@ -75,11 +82,11 @@ function readState_(docId) {
     const content = file.getBlob().getDataAsString()
     const state = JSON.parse(content)
     
-    // Load tagChildren from temp doc if in writing phase
+    // Load tagChildren from temp file if in writing phase
     if (state.phase === 'writing') {
-      const tempDoc = getTempDataDoc_(docId)
-      if (tempDoc) {
-        state.tagChildrenData = deserializeTagChildren_(tempDoc)
+      const tempFile = getTempDataFile_(docId)
+      if (tempFile) {
+        state.tagChildrenData = deserializeTagChildren_(tempFile)
       }
     }
     
@@ -90,103 +97,86 @@ function readState_(docId) {
   }
 }
 
-function serializeTagChildren_(tagChildren, tempDoc) {
-  // Store tagChildren data in a temporary document
-  // Format: One section per tag with all the collected data
-  const body = tempDoc.getBody()
-  body.clear()
-  
-  Object.keys(tagChildren).sort().forEach(tag => {
-    // Add tag as heading
-    const tagHeader = body.appendParagraph(tag)
-    tagHeader.setHeading(DocumentApp.ParagraphHeading.HEADING2)
-    
-    tagChildren[tag].forEach(tagChild => {
-      // Add date as heading
-      const dateHeader = body.appendParagraph(tagChild.date)
-      dateHeader.setHeading(DocumentApp.ParagraphHeading.HEADING3)
-      
-      // Add all elements
-      tagChild.elements.forEach(element => {
-        const elementType = element.getType()
-        switch (elementType) {
-          case DocumentApp.ElementType.PARAGRAPH:
-            body.appendParagraph(element.copy())
-            break
-          case DocumentApp.ElementType.LIST_ITEM:
-            body.appendListItem(element.copy())
-            break
-          case DocumentApp.ElementType.INLINE_IMAGE:
-            body.appendImage(element.copy())
-            break
-          default:
-            // For other types, try to append as paragraph
-            body.appendParagraph(element.copy())
-        }
-      })
-      
-      // Add separator
-      body.appendParagraph('---')
-    })
-  })
-  
-  tempDoc.saveAndClose()
-}
-
-function deserializeTagChildren_(tempDoc) {
-  // Rebuild tagChildren structure from temp document
-  const tagChildren = {}
-  let currentTag = null
-  let currentDate = null
-  let currentElements = []
-  
-  const body = tempDoc.getBody()
-  const numChildren = body.getNumChildren()
-  
-  for (let i = 0; i < numChildren; i++) {
-    const child = body.getChild(i)
-    
-    if (child.getType() === DocumentApp.ElementType.PARAGRAPH) {
-      const para = child.asParagraph()
-      const heading = para.getHeading()
-      const text = para.getText()
-      
-      if (heading === DocumentApp.ParagraphHeading.HEADING2) {
-        // New tag
-        currentTag = text
-        tagChildren[currentTag] = []
-        currentDate = null
-        currentElements = []
-      } else if (heading === DocumentApp.ParagraphHeading.HEADING3) {
-        // New date - save previous if exists
-        if (currentTag && currentDate && currentElements.length > 0) {
-          tagChildren[currentTag].push({
-            date: currentDate,
-            elements: currentElements
-          })
-        }
-        currentDate = text
-        currentElements = []
-      } else if (text === '---') {
-        // Separator - save current section
-        if (currentTag && currentDate && currentElements.length > 0) {
-          tagChildren[currentTag].push({
-            date: currentDate,
-            elements: currentElements
-          })
-        }
-        currentElements = []
-      } else if (currentDate) {
-        // Regular content
-        currentElements.push(child.copy())
-      }
-    } else if (currentDate) {
-      // Non-paragraph element
-      currentElements.push(child.copy())
-    }
+function serializeElement_(element) {
+  // Convert Document element to lightweight serializable format
+  const elementType = element.getType()
+  const serialized = {
+    type: elementType.toString()
   }
   
-  return tagChildren
+  switch (elementType) {
+    case DocumentApp.ElementType.PARAGRAPH:
+      const para = element.asParagraph()
+      serialized.text = para.getText()
+      serialized.heading = para.getHeading().toString()
+      break
+    case DocumentApp.ElementType.LIST_ITEM:
+      const listItem = element.asListItem()
+      serialized.text = listItem.getText()
+      serialized.glyphType = listItem.getGlyphType().toString()
+      break
+    case DocumentApp.ElementType.INLINE_IMAGE:
+      // Store image as base64 to avoid slow Docs API calls
+      const img = element.asInlineImage()
+      serialized.blob = Utilities.base64Encode(img.getBlob().getBytes())
+      serialized.width = img.getWidth()
+      serialized.height = img.getHeight()
+      break
+    default:
+      serialized.text = element.getText ? element.getText() : ''
+  }
+  
+  return serialized
+}
+
+function deserializeElement_(serialized, doc) {
+  // Reconstruct Document element from serialized format
+  // Returns a simple object that can be used in the writing phase
+  return {
+    serializedType: serialized.type,
+    text: serialized.text || '',
+    heading: serialized.heading,
+    glyphType: serialized.glyphType,
+    imageBlob: serialized.blob,
+    imageWidth: serialized.width,
+    imageHeight: serialized.height
+  }
+}
+
+function serializeTagChildren_(tagChildren, tempFile) {
+  // Store tagChildren data as JSON (much faster than Docs API)
+  const serializedData = {}
+  
+  Object.keys(tagChildren).forEach(tag => {
+    serializedData[tag] = tagChildren[tag].map(tagChild => ({
+      date: tagChild.date,
+      elements: tagChild.elements.map(el => serializeElement_(el))
+    }))
+  })
+  
+  const content = JSON.stringify(serializedData)
+  tempFile.setContent(content)
+}
+
+function deserializeTagChildren_(tempFile) {
+  // Rebuild tagChildren structure from JSON file
+  try {
+    const content = tempFile.getBlob().getDataAsString()
+    const serializedData = JSON.parse(content)
+    const tagChildren = {}
+    
+    Object.keys(serializedData).forEach(tag => {
+      tagChildren[tag] = serializedData[tag].map(tagChild => ({
+        date: tagChild.date,
+        elements: tagChild.elements.map(el => deserializeElement_(el))
+      }))
+    })
+    
+    return tagChildren
+  } catch (e) {
+    Logger.log('Error deserializing tagChildren: ' + e)
+    return {}
+  }
 }
 
 function writeState_(docId, state, tagChildren) {
@@ -195,13 +185,13 @@ function writeState_(docId, state, tagChildren) {
     file = createStateFile_(docId)
   }
   
-  // If we have tagChildren to save, serialize them to temp doc
+  // If we have tagChildren to save, serialize them to temp file (fast JSON blob)
   if (tagChildren && Object.keys(tagChildren).length > 0) {
-    let tempDoc = getTempDataDoc_(docId)
-    if (!tempDoc) {
-      tempDoc = createTempDataDoc_(docId)
+    let tempFile = getTempDataFile_(docId)
+    if (!tempFile) {
+      tempFile = createTempDataFile_(docId)
     }
-    serializeTagChildren_(tagChildren, tempDoc)
+    serializeTagChildren_(tagChildren, tempFile)
   }
   
   // Create a serializable version of the state (without tagChildren)
@@ -228,9 +218,9 @@ function deleteStateFiles_(docId) {
     stateFile.setTrashed(true)
   }
   
-  const tempDoc = getTempDataDoc_(docId)
-  if (tempDoc) {
-    DriveApp.getFileById(tempDoc.getId()).setTrashed(true)
+  const tempFile = getTempDataFile_(docId)
+  if (tempFile) {
+    tempFile.setTrashed(true)
   }
 }
 
@@ -569,17 +559,40 @@ function writingPhase_(doc, state, startTime, docId) {
 
       dateText.setBold(true)
       tagChild.elements.forEach(child => {
-        switch (child.getType()) {
-          case DocumentApp.ElementType.INLINE_IMAGE:
-            body.appendImage(child.copy())
-            break;
-          case DocumentApp.ElementType.PARAGRAPH:
-          case DocumentApp.ElementType.LIST_ITEM:
-            const truncated = truncateText_(child.copy().getText().replace(TAGS_REGEX, ''), MAX_CHARS_PER_ENTRY)
-            child.getType() === DocumentApp.ElementType.PARAGRAPH ?
-              body.appendParagraph(truncated) :
+        // Handle both regular Document elements and deserialized elements
+        const isDeserialized = child.serializedType !== undefined
+        
+        if (isDeserialized) {
+          // Element was loaded from state - use serialized data
+          if (child.serializedType.includes('INLINE_IMAGE')) {
+            if (child.imageBlob) {
+              const imageBlob = Utilities.newBlob(Utilities.base64Decode(child.imageBlob))
+              const image = body.appendImage(imageBlob)
+              if (child.imageWidth) image.setWidth(child.imageWidth)
+              if (child.imageHeight) image.setHeight(child.imageHeight)
+            }
+          } else {
+            const truncated = truncateText_(child.text.replace(TAGS_REGEX, ''), MAX_CHARS_PER_ENTRY)
+            if (child.serializedType.includes('LIST_ITEM')) {
               body.appendListItem(truncated)
-            break;
+            } else {
+              body.appendParagraph(truncated)
+            }
+          }
+        } else {
+          // Element is from current gathering - use Document API
+          switch (child.getType()) {
+            case DocumentApp.ElementType.INLINE_IMAGE:
+              body.appendImage(child.copy())
+              break;
+            case DocumentApp.ElementType.PARAGRAPH:
+            case DocumentApp.ElementType.LIST_ITEM:
+              const truncated = truncateText_(child.copy().getText().replace(TAGS_REGEX, ''), MAX_CHARS_PER_ENTRY)
+              child.getType() === DocumentApp.ElementType.PARAGRAPH ?
+                body.appendParagraph(truncated) :
+                body.appendListItem(truncated)
+              break;
+          }
         }
       })
       body.appendParagraph('')
