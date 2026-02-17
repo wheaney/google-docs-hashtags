@@ -1,3 +1,33 @@
+// Google Docs Hashtag Indexing Script with State Management
+//
+// This script indexes hashtags in a Google Doc and creates a "Tags" section
+// with references to all tagged content.
+//
+// STATE MANAGEMENT:
+// To handle large documents that may timeout (6 minute limit), this script
+// implements a resumable execution model:
+//
+// 1. Two phases: GATHERING (collect hashtags) and WRITING (build Tags section)
+// 2. Runtime is tracked; after ~5 minutes, state is saved and execution stops
+// 3. State is stored in:
+//    - JSON file in Drive: tracks phase and progress indices
+//    - Temporary Doc in Drive: stores collected tagChildren data (can't serialize to JSON)
+// 4. On next run, if state file is newer than document, execution resumes
+// 5. On successful completion, state files are cleaned up
+//
+// GATHERING PHASE:
+// - Iterates through document children, tracking childIndex
+// - Collects hashtags and associated content into tagChildren structure
+// - If time limit reached, saves state (including tagChildren to temp doc) and exits
+// - On resume, continues from saved childIndex
+//
+// WRITING PHASE:
+// - Iterates through collected tags, tracking currentTagIndex and currentTagChildIndex
+// - Writes tag sections to the document
+// - If time limit reached, saves state and exits (tagChildren already in temp doc)
+// - On resume, continues from saved indices
+//
+
 const TAGS_REGEX_STRING = "#[^\\s]+"
 const TAGS_REGEX = new RegExp(TAGS_REGEX_STRING, 'g')
 const TAGS_SECTION_NAME = "Tags"
@@ -78,7 +108,21 @@ function serializeTagChildren_(tagChildren, tempDoc) {
       
       // Add all elements
       tagChild.elements.forEach(element => {
-        body.appendParagraph('').append(element.copy())
+        const elementType = element.getType()
+        switch (elementType) {
+          case DocumentApp.ElementType.PARAGRAPH:
+            body.appendParagraph(element.copy())
+            break
+          case DocumentApp.ElementType.LIST_ITEM:
+            body.appendListItem(element.copy())
+            break
+          case DocumentApp.ElementType.INLINE_IMAGE:
+            body.appendImage(element.copy())
+            break
+          default:
+            // For other types, try to append as paragraph
+            body.appendParagraph(element.copy())
+        }
       })
       
       // Add separator
