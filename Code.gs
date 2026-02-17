@@ -433,7 +433,8 @@ function gatheringPhase_(doc, state, startTime, docId) {
     
     if (!state.inTagsSection) {
       if (state.lastDate && child) {
-        // Process multi-line tag matches - iterate backwards to safely remove items
+        // Process multi-line tag matches
+        // Iterate backwards to safely remove completed matches without index adjustment
         for (var tagMatchIndex = state.currentTagMatches.length - 1; tagMatchIndex >= 0; tagMatchIndex--) {
           const tagMatch = state.currentTagMatches[tagMatchIndex]
           tagMatch.elementDetails.elements.push(child.copy())
@@ -536,10 +537,11 @@ function writingPhase_(doc, state, startTime, docId) {
       changeCount += 2
     }
     
-    // Process tag children in reverse order (earliest to most recent dates)
-    // Iterate backwards to avoid creating a reversed copy
-    const numTagChildren = tagChildren.length
-    for (let childIdx = state.currentTagChildIndex; childIdx < numTagChildren; childIdx++) {
+    // Reverse the ordering so we get them in ascending order (earliest to most recent dates)
+    const reversedChildren = tagChildren.slice().reverse()
+    
+    // Process tag children starting from where we left off
+    for (let childIdx = state.currentTagChildIndex; childIdx < reversedChildren.length; childIdx++) {
       // Check if we're approaching the time limit
       if (Date.now() - startTime > MAX_RUNTIME_MS) {
         state.currentTagIndex = tagIndex
@@ -550,9 +552,7 @@ function writingPhase_(doc, state, startTime, docId) {
         return state
       }
       
-      // Access in reverse order (numTagChildren - 1 - childIdx)
-      const reverseIdx = numTagChildren - 1 - childIdx
-      const tagChild = tagChildren[reverseIdx]
+      const tagChild = reversedChildren[childIdx]
       
       if (changeCount >= SAVE_THRESHOLD) {
         doc.saveAndClose()
