@@ -345,6 +345,10 @@ function findTagsAndBuildIndex() {
       currentTagIndex: 0,
       currentTagChildIndex: 0
     }
+  } else {
+    // Ensure all required properties exist when resuming
+    if (!state.currentTagMatches) state.currentTagMatches = []
+    if (!state.tagChildren) state.tagChildren = {}
   }
   
   try {
