@@ -209,6 +209,7 @@ function writeState_(docId, state, tagChildren) {
     phase: state.phase,
     childIndex: state.childIndex || 0,
     childrenRemoved: state.childrenRemoved || 0,
+    totalChildren: state.totalChildren || 0,
     lastDate: state.lastDate,
     inTagsSection: state.inTagsSection || false,
     tagsParagraphCreated: state.tagsParagraphCreated || false,
@@ -330,10 +331,14 @@ function findTagsAndBuildIndex() {
   
   // Initialize state if starting fresh
   if (!state) {
+    // Get total children count at the start
+    const totalChildren = doc.getBody().getNumChildren()
+    
     state = {
       phase: 'gathering',
       childIndex: 0,
       childrenRemoved: 0,
+      totalChildren: totalChildren,  // Store original count
       tagChildren: {},
       currentTagMatches: [],
       lastDate: null,
@@ -375,11 +380,13 @@ function findTagsAndBuildIndex() {
 
 function gatheringPhase_(doc, state, startTime, docId) {
   let changeCount = 0
-  const totalChildren = doc.getBody().getNumChildren()
+  // Use the original totalChildren count from when we started
+  const totalChildren = state.totalChildren
   
   for (var childIndex = state.childIndex; childIndex < totalChildren; childIndex++) {
     // Check if we're approaching the time limit
-    if (Date.now() - startTime > MAX_RUNTIME_MS) {
+    // Only save if we're not in the middle of collecting multi-line tags
+    if (Date.now() - startTime > MAX_RUNTIME_MS && state.currentTagMatches.length === 0) {
       state.childIndex = childIndex
       writeState_(docId, state, state.tagChildren)
       doc.saveAndClose()
