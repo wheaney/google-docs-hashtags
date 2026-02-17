@@ -230,8 +230,17 @@ function shouldResumeFromState_(docId) {
   const docLastModified = docFile.getLastUpdated()
   const stateLastModified = file.getLastUpdated()
   
-  // Resume if state file is newer than the document
-  return stateLastModified > docLastModified
+  // The document gets saved when we checkpoint state, so it will be slightly newer than state file
+  // Resume if state file is recent (within 1 minute of doc modification)
+  // Don't resume if document was modified significantly after state was saved (user made changes)
+  const timeDiff = Math.abs(docLastModified.getTime() - stateLastModified.getTime())
+  const oneMinute = 60 * 1000
+  
+  Logger.log('State file timestamp: ' + stateLastModified)
+  Logger.log('Doc last modified: ' + docLastModified)
+  Logger.log('Time difference (ms): ' + timeDiff)
+  
+  return timeDiff < oneMinute
 }
 
 function truncateText_(text, maxLength) {
