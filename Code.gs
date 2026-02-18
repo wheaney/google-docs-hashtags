@@ -509,7 +509,7 @@ function writingPhase_(doc, state, startTime, docId) {
   
   // Find or create the Tags header
   let tagsHeader = null
-  const body = doc.getBody()
+  let body = doc.getBody()
   const numChildren = body.getNumChildren()
   
   // Look for existing Tags header (should be at the end after gathering phase)
@@ -573,6 +573,7 @@ function writingPhase_(doc, state, startTime, docId) {
       if (changeCount >= SAVE_THRESHOLD) {
         doc.saveAndClose()
         doc = DocumentApp.openById(doc.getId())
+        body = doc.getBody()
         changeCount = 0
       }
       
