@@ -97,6 +97,19 @@ function readState_(docId) {
 }
 
 function serializeElement_(element) {
+  // If element is already in deserialized format (from loaded state), convert to serialized format
+  if (element && element.serializedType !== undefined) {
+    return {
+      type: element.serializedType,
+      text: element.text,
+      heading: element.heading,
+      glyphType: element.glyphType,
+      blob: element.imageBlob,
+      width: element.imageWidth,
+      height: element.imageHeight
+    }
+  }
+  
   // Convert Document element to lightweight serializable format
   const elementType = element.getType()
   const typeString = elementType.toString()
