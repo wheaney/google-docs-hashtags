@@ -27,3 +27,20 @@ If used specifically for journaling:
 4. From the `functions` dropdown next to the Run/Debug buttons above the editor, choose `findTagsAndBuildIndex`.
 5. Once you've set up the document with the appropriate headings as described in the last section, click `Run` and leave this browser tab open until it completes. 
 6. When it's done, the `Tags` section of the document will be filled out.
+
+### Large Documents
+
+For large documents, the script implements a resumable execution model to avoid the 6-minute Apps Script timeout:
+
+* The script tracks its progress and saves state after approximately 5.5 minutes of runtime
+* State is saved to temporary JSON files in your Google Drive (fast blob storage, not Docs API)
+* Document elements are serialized to a lightweight format (text and metadata only) for quick saves
+* If execution times out, simply run the script again - it will automatically resume from where it left off
+* The script will detect if the document has been modified since the last run and start fresh if needed
+* Upon successful completion, all temporary state files are automatically cleaned up
+* The script operates in two phases:
+  1. **Gathering phase**: Scans the document and collects all hashtags (~5.5 min limit with fast JSON save)
+  2. **Writing phase**: Builds the Tags section from collected data (~5.5 min limit per iteration)
+* Progress is saved in both phases, allowing resumption at any point
+* Serialization uses JSON blobs instead of Docs API for significantly faster state saves
+* Serialization uses JSON blobs instead of Docs API for significantly faster state saves

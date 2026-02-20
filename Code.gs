@@ -1,9 +1,254 @@
+// Google Docs Hashtag Indexing Script with State Management
+//
+// This script indexes hashtags in a Google Doc and creates a "Tags" section
+// with references to all tagged content.
+//
+// STATE MANAGEMENT:
+// To handle large documents that may timeout (6 minute limit), this script
+// implements a resumable execution model:
+//
+// 1. Two phases: GATHERING (collect hashtags) and WRITING (build Tags section)
+// 2. Runtime is tracked; after ~5.5 minutes, state is saved and execution stops
+// 3. State is stored in:
+//    - JSON file in Drive: tracks phase and progress indices
+//    - JSON data file in Drive: stores collected tagChildren as lightweight JSON
+//      (much faster than Docs API - elements serialized to text/metadata)
+// 4. On next run, if state file is newer than document, execution resumes
+// 5. On successful completion, state files are cleaned up
+//
+// GATHERING PHASE:
+// - Iterates through document children, tracking childIndex
+// - Collects hashtags and associated content into tagChildren structure
+// - If time limit reached, saves state (serializing tagChildren to JSON) and exits
+// - On resume, continues from saved childIndex
+//
+// WRITING PHASE:
+// - Iterates through collected tags, tracking currentTagIndex and currentTagChildIndex
+// - Writes tag sections to the document
+// - If time limit reached, saves state and exits (tagChildren already in JSON file)
+// - On resume, continues from saved indices
+//
+// PERFORMANCE NOTES:
+// - MAX_RUNTIME_MS set to 5.5 minutes (allows safe margin before 6-minute timeout)
+// - Document saved before state file to ensure state file timestamp is more recent
+// - JSON blob serialization is much faster than Docs API writes
+// - Document elements converted to lightweight format (text + metadata only)
+//
+
 const TAGS_REGEX_STRING = "#[^\\s]+"
 const TAGS_REGEX = new RegExp(TAGS_REGEX_STRING, 'g')
 const TAGS_SECTION_NAME = "Tags"
 const MAX_CHARS_PER_ENTRY = 150
 const ELLIPSIS = "..."
 const SAVE_THRESHOLD = 100
+const MAX_RUNTIME_MS = 5.5 * 60 * 1000 // 5.5 minutes in milliseconds
+const STATE_FILE_PREFIX = "hashtag_indexing_state"
+const TEMP_DATA_PREFIX = "hashtag_temp_data"
+
+function getStateFile_(docId) {
+  const fileName = `${STATE_FILE_PREFIX}_${docId}.json`
+  const files = DriveApp.getFilesByName(fileName)
+  if (files.hasNext()) {
+    return files.next()
+  }
+  return null
+}
+
+function getTempDataFile_(docId) {
+  const fileName = `${TEMP_DATA_PREFIX}_${docId}.json`
+  const files = DriveApp.getFilesByName(fileName)
+  if (files.hasNext()) {
+    return files.next()
+  }
+  return null
+}
+
+function createStateFile_(docId) {
+  const fileName = `${STATE_FILE_PREFIX}_${docId}.json`
+  const blob = Utilities.newBlob('{}', 'application/json', fileName)
+  return DriveApp.createFile(blob)
+}
+
+function createTempDataFile_(docId) {
+  const fileName = `${TEMP_DATA_PREFIX}_${docId}.json`
+  const blob = Utilities.newBlob('{}', 'application/json', fileName)
+  return DriveApp.createFile(blob)
+}
+
+function readState_(docId) {
+  const file = getStateFile_(docId)
+  if (!file) return null
+  
+  try {
+    const content = file.getBlob().getDataAsString()
+    const state = JSON.parse(content)
+    
+    // Load tagChildren from temp file for both gathering and writing phases
+    const tempFile = getTempDataFile_(docId)
+    if (tempFile) {
+      state.tagChildrenData = deserializeTagChildren_(tempFile)
+    }
+    
+    return state
+  } catch (e) {
+    Logger.log('Error reading state file: ' + e)
+    return null
+  }
+}
+
+function serializeElement_(element) {
+  // If element is already in deserialized format (from loaded state), convert to serialized format
+  if (element && element.serializedType !== undefined) {
+    return {
+      type: element.serializedType,
+      text: element.text,
+      heading: element.heading,
+      glyphType: element.glyphType,
+      blob: element.imageBlob,
+      width: element.imageWidth,
+      height: element.imageHeight
+    }
+  }
+  
+  // Convert Document element to lightweight serializable format
+  const elementType = element.getType()
+  const typeString = elementType.toString()
+  const serialized = {
+    type: typeString
+  }
+  
+  if (typeString === 'PARAGRAPH') {
+    const para = element.asParagraph()
+    serialized.text = para.getText()
+    serialized.heading = para.getHeading().toString()
+  } else if (typeString === 'LIST_ITEM') {
+    const listItem = element.asListItem()
+    serialized.text = listItem.getText()
+    serialized.glyphType = listItem.getGlyphType().toString()
+  } else if (typeString === 'INLINE_IMAGE') {
+    // Store image as base64 to avoid slow Docs API calls
+    const img = element.asInlineImage()
+    serialized.blob = Utilities.base64Encode(img.getBlob().getBytes())
+    serialized.width = img.getWidth()
+    serialized.height = img.getHeight()
+  } else {
+    serialized.text = element.getText ? element.getText() : ''
+  }
+  
+  return serialized
+}
+
+function deserializeElement_(serialized, doc) {
+  // Reconstruct Document element from serialized format
+  // Returns a simple object that can be used in the writing phase
+  return {
+    serializedType: serialized.type,
+    text: serialized.text || '',
+    heading: serialized.heading,
+    glyphType: serialized.glyphType,
+    imageBlob: serialized.blob,
+    imageWidth: serialized.width,
+    imageHeight: serialized.height
+  }
+}
+
+function serializeTagChildren_(tagChildren, tempFile) {
+  // Store tagChildren data as JSON (much faster than Docs API)
+  const serializedData = {}
+  
+  Object.keys(tagChildren).forEach(tag => {
+    serializedData[tag] = tagChildren[tag].map(tagChild => ({
+      date: tagChild.date,
+      elements: tagChild.elements.map(el => serializeElement_(el))
+    }))
+  })
+  
+  const content = JSON.stringify(serializedData)
+  tempFile.setContent(content)
+}
+
+function deserializeTagChildren_(tempFile) {
+  // Rebuild tagChildren structure from JSON file
+  try {
+    const content = tempFile.getBlob().getDataAsString()
+    const serializedData = JSON.parse(content)
+    const tagChildren = {}
+    
+    Object.keys(serializedData).forEach(tag => {
+      tagChildren[tag] = serializedData[tag].map(tagChild => ({
+        date: tagChild.date,
+        elements: tagChild.elements.map(el => deserializeElement_(el))
+      }))
+    })
+    
+    return tagChildren
+  } catch (e) {
+    Logger.log('Error deserializing tagChildren: ' + e)
+    return {}
+  }
+}
+
+function writeState_(docId, state, tagChildren) {
+  let file = getStateFile_(docId)
+  if (!file) {
+    file = createStateFile_(docId)
+  }
+  
+  // If we have tagChildren to save, serialize them to temp file (fast JSON blob)
+  if (tagChildren && Object.keys(tagChildren).length > 0) {
+    let tempFile = getTempDataFile_(docId)
+    if (!tempFile) {
+      tempFile = createTempDataFile_(docId)
+    }
+    serializeTagChildren_(tagChildren, tempFile)
+  }
+  
+  // Create a serializable version of the state (without tagChildren)
+  const serializableState = {
+    phase: state.phase,
+    childIndex: state.childIndex || 0,
+    childrenRemoved: state.childrenRemoved || 0,
+    totalChildren: state.totalChildren || 0,
+    lastDate: state.lastDate,
+    inTagsSection: state.inTagsSection || false,
+    tagsParagraphCreated: state.tagsParagraphCreated || false,
+    currentTagIndex: state.currentTagIndex || 0,
+    currentTagChildIndex: state.currentTagChildIndex || 0,
+    sortedTags: state.sortedTags || []
+  }
+  
+  const content = JSON.stringify(serializableState)
+  file.setContent(content)
+}
+
+function deleteStateFiles_(docId) {
+  const stateFile = getStateFile_(docId)
+  if (stateFile) {
+    stateFile.setTrashed(true)
+  }
+  
+  const tempFile = getTempDataFile_(docId)
+  if (tempFile) {
+    tempFile.setTrashed(true)
+  }
+}
+
+function shouldResumeFromState_(docId) {
+  const file = getStateFile_(docId)
+  if (!file) return false
+  
+  // Get document last modified date from Drive
+  const docFile = DriveApp.getFileById(docId)
+  const docLastModified = docFile.getLastUpdated()
+  const stateLastModified = file.getLastUpdated()
+  
+  Logger.log('State file timestamp: ' + stateLastModified)
+  Logger.log('Doc last modified: ' + docLastModified)
+  
+  // Resume if state file is more recent than the document
+  // This means we checkpointed after the last document modification
+  return stateLastModified > docLastModified
+}
 
 function truncateText_(text, maxLength) {
   if (text.length <= maxLength) return text
@@ -75,19 +320,96 @@ function getHeadingId_(document, headingNamedRangeName) {
 
 function findTagsAndBuildIndex() {
   let doc = DocumentApp.getActiveDocument()
-  let changeCount = 0
-  var lastDate = null
-  var currentTagMatches = []
-  const tagChildren = {}
-  var inTagsSection = false
-  var tagsParagraph = null
+  const docId = doc.getId()
+  const startTime = Date.now()
+  
+  // Check if we should resume from a saved state
+  let state = null
+  if (shouldResumeFromState_(docId)) {
+    state = readState_(docId)
+    if (state) {
+      Logger.log('Resuming from saved state: phase=' + state.phase)
+    }
+  }
+  
+  // Initialize state if starting fresh
+  if (!state) {
+    // Get total children count at the start
+    const totalChildren = doc.getBody().getNumChildren()
+    
+    state = {
+      phase: 'gathering',
+      childIndex: 0,
+      childrenRemoved: 0,
+      totalChildren: totalChildren,  // Store original count
+      tagChildren: {},
+      currentTagMatches: [],
+      lastDate: null,
+      inTagsSection: false,
+      tagsParagraphCreated: false,
+      // Writing phase state
+      sortedTags: [],
+      currentTagIndex: 0,
+      currentTagChildIndex: 0
+    }
+  } else {
+    // Ensure all required properties exist when resuming
+    if (!state.currentTagMatches) state.currentTagMatches = []
+    
+    // Restore tagChildren from loaded data if available
+    if (state.tagChildrenData) {
+      state.tagChildren = state.tagChildrenData
+    } else if (!state.tagChildren) {
+      state.tagChildren = {}
+    }
+  }
+  
+  try {
+    if (state.phase === 'gathering') {
+      state = gatheringPhase_(doc, state, startTime, docId)
+    }
+    
+    if (state.phase === 'writing') {
+      // Restore tagChildren from temp doc if resuming
+      if (state.tagChildrenData) {
+        state.tagChildren = state.tagChildrenData
+        state.sortedTags = Object.keys(state.tagChildren).sort()
+      }
+      
+      state = writingPhase_(doc, state, startTime, docId)
+    }
+    
+    // If we completed successfully, clean up the state files
+    if (state.phase === 'complete') {
+      deleteStateFiles_(docId)
+      doc.saveAndClose()
+      Logger.log('Indexing completed successfully')
+    }
+  } catch (e) {
+    Logger.log('Error during indexing: ' + e)
+    throw e
+  }
+}
 
-  const totalChildren = doc.getBody().getNumChildren()
-  var childrenRemoved = 0
-  for (var childIndex = 0; childIndex < totalChildren; childIndex++) {
-    // our childIndex keeps increasing, but the number of children in the document decreases if we remove them, 
-    // (when inTagsSection is true) so the real index of the next child actually changes
-    const child = doc.getBody().getChild(childIndex-childrenRemoved)
+function gatheringPhase_(doc, state, startTime, docId) {
+  let changeCount = 0
+  // Use the original totalChildren count from when we started
+  const totalChildren = state.totalChildren
+  
+  for (var childIndex = state.childIndex; childIndex < totalChildren; childIndex++) {
+    // Check if we're approaching the time limit
+    // Only save state when not collecting multi-line tags to prevent data corruption
+    // (currentTagMatches tracks in-progress multi-line tag collections)
+    if (Date.now() - startTime > MAX_RUNTIME_MS && state.currentTagMatches.length === 0) {
+      state.childIndex = childIndex
+      doc.saveAndClose()
+      writeState_(docId, state, state.tagChildren)
+      const progress = Math.round((childIndex / totalChildren) * 100)
+      Logger.log('Saved gathering phase state at child ' + childIndex + '/' + totalChildren + ' (' + progress + '% complete)')
+      return state
+    }
+    
+    const child = doc.getBody().getChild(childIndex - state.childrenRemoved)
     
     const isParagraph = child.getType() === DocumentApp.ElementType.PARAGRAPH
     if (isParagraph) {
@@ -105,30 +427,35 @@ function findTagsAndBuildIndex() {
               const rangeBuilder = doc.newRange();
               rangeBuilder.addElement(paragraph)
               doc.addNamedRange(heading, rangeBuilder.build())
-              lastDate = heading
+              state.lastDate = heading
             }
             break
           case DocumentApp.ParagraphHeading.HEADING1:
             if (paragraph.getText() === TAGS_SECTION_NAME) {
-              inTagsSection = true
+              state.inTagsSection = true
 
               // append a new Tags section, it won't get deleted as we delete everything up to the last paragraph
-              tagsParagraph = doc.getBody().appendParagraph(TAGS_SECTION_NAME)
+              if (!state.tagsParagraphCreated) {
+                doc.getBody().appendParagraph(TAGS_SECTION_NAME)
+                state.tagsParagraphCreated = true
+              }
             }
             break
         }
       }
     }
     
-    if (!inTagsSection) {
-      if (lastDate && child) {
-        for (var tagMatchIndex = 0; tagMatchIndex < currentTagMatches.length; tagMatchIndex++) {
-          const tagMatch = currentTagMatches[tagMatchIndex]
+    if (!state.inTagsSection) {
+      if (state.lastDate && child) {
+        // Process multi-line tag matches
+        // Iterate backwards to safely remove completed matches without index adjustment
+        for (var tagMatchIndex = state.currentTagMatches.length - 1; tagMatchIndex >= 0; tagMatchIndex--) {
+          const tagMatch = state.currentTagMatches[tagMatchIndex]
           tagMatch.elementDetails.elements.push(child.copy())
-          const childrenRemaining = tagMatch.childrenRemaining-1
+          const childrenRemaining = tagMatch.childrenRemaining - 1
           if (childrenRemaining === 0) {
-            tagChildren[tagMatch.tag].push(tagMatch.elementDetails)
-            currentTagMatches.splice(tagMatchIndex, 1)
+            state.tagChildren[tagMatch.tag].push(tagMatch.elementDetails)
+            state.currentTagMatches.splice(tagMatchIndex, 1)
           } else {
             tagMatch.childrenRemaining = childrenRemaining
           }
@@ -137,21 +464,21 @@ function findTagsAndBuildIndex() {
         const tagMatches = child.getText().length && child.getText().match(TAGS_REGEX)
         if (tagMatches) {
           tagMatches.forEach(tagMatch => {
-            const elementDetails = {date: lastDate, elements: [child.copy()]}
+            const elementDetails = {date: state.lastDate, elements: [child.copy()]}
             const tagDetails = tagMatch.split('_')
             const tag = tagDetails[0]
-            if (!tagChildren[tag]) {
-              tagChildren[tag] = []
+            if (!state.tagChildren[tag]) {
+              state.tagChildren[tag] = []
             }
 
             if (tagDetails[1] && tagDetails[1].startsWith('+')) {
-              currentTagMatches.push({
+              state.currentTagMatches.push({
                 tag: tag,
                 childrenRemaining: Number(tagDetails[1].substring(1)),
                 elementDetails: elementDetails
               })
             } else {
-              tagChildren[tag].push(elementDetails)
+              state.tagChildren[tag].push(elementDetails)
             }
           })
         }
@@ -159,25 +486,98 @@ function findTagsAndBuildIndex() {
     } else {
       // if we've detected the Tags section, delete it and everything after so we can rebuild it later
       child.removeFromParent()
-      childrenRemoved++
+      state.childrenRemoved++
     }
   }
+  
+  // Gathering phase complete, move to writing phase
+  state.phase = 'writing'
+  state.sortedTags = Object.keys(state.tagChildren).sort()
+  state.currentTagIndex = 0
+  state.currentTagChildIndex = 0
+  
+  // Save state before transitioning to writing phase
+  writeState_(docId, state, state.tagChildren)
+  Logger.log('Gathering phase complete, transitioning to writing phase')
+  
+  return state
+}
 
+function writingPhase_(doc, state, startTime, docId) {
   const docsApiDoc = Docs.Documents.get(doc.getId())
-  const tagsHeader = tagsParagraph || doc.getBody().appendParagraph(TAGS_SECTION_NAME)
-  tagsHeader.setHeading(DocumentApp.ParagraphHeading.HEADING1)
-  Object.keys(tagChildren).sort().forEach(tag => {
-    const tagHeader = doc.getBody().appendParagraph(tag)
-    tagHeader.setHeading(DocumentApp.ParagraphHeading.HEADING2)
-    changeCount += 2
-
-    // reverse the ordering so we get them in ascending order (earliest to most recent dates)
-    tagChildren[tag].reverse().forEach(tagChild => {
+  let changeCount = 0
+  
+  // Find or create the Tags header
+  let tagsHeader = null
+  let body = doc.getBody()
+  const numChildren = body.getNumChildren()
+  
+  // Look for existing Tags header (should be at the end after gathering phase)
+  for (let i = numChildren - 1; i >= 0; i--) {
+    const child = body.getChild(i)
+    if (child.getType() === DocumentApp.ElementType.PARAGRAPH) {
+      const para = child.asParagraph()
+      if (para.getHeading() === DocumentApp.ParagraphHeading.HEADING1 &&
+          para.getText() === TAGS_SECTION_NAME) {
+        tagsHeader = para
+        break
+      }
+    }
+  }
+  
+  if (!tagsHeader) {
+    tagsHeader = body.appendParagraph(TAGS_SECTION_NAME)
+    tagsHeader.setHeading(DocumentApp.ParagraphHeading.HEADING1)
+  }
+  
+  // Process tags starting from where we left off
+  for (let tagIndex = state.currentTagIndex; tagIndex < state.sortedTags.length; tagIndex++) {
+    // Check if we're approaching the time limit
+    if (Date.now() - startTime > MAX_RUNTIME_MS) {
+      state.currentTagIndex = tagIndex
+      doc.saveAndClose()
+      writeState_(docId, state, null) // Don't re-save tagChildren, just state
+      const progress = Math.round((tagIndex / state.sortedTags.length) * 100)
+      Logger.log('Saved writing phase state at tag ' + (tagIndex + 1) + '/' + state.sortedTags.length + ' (' + progress + '% complete)')
+      return state
+    }
+    
+    const tag = state.sortedTags[tagIndex]
+    const tagChildren = state.tagChildren[tag]
+    
+    // Add tag header if we're starting a new tag
+    if (state.currentTagChildIndex === 0) {
+      const tagHeader = body.appendParagraph(tag)
+      tagHeader.setHeading(DocumentApp.ParagraphHeading.HEADING2)
+      changeCount += 2
+    }
+    
+    // Reverse the ordering so we get them in ascending order (earliest to most recent dates)
+    const reversedChildren = tagChildren.slice().reverse()
+    
+    // Process tag children starting from where we left off
+    for (let childIdx = state.currentTagChildIndex; childIdx < reversedChildren.length; childIdx++) {
+      // Check if we're approaching the time limit
+      if (Date.now() - startTime > MAX_RUNTIME_MS) {
+        state.currentTagIndex = tagIndex
+        state.currentTagChildIndex = childIdx
+        doc.saveAndClose()
+        writeState_(docId, state, null) // Don't re-save tagChildren, just state
+        const tagProgress = Math.round((tagIndex / state.sortedTags.length) * 100)
+        Logger.log('Saved writing phase state at tag ' + (tagIndex + 1) + '/' + state.sortedTags.length + ', entry ' + (childIdx + 1) + '/' + reversedChildren.length + ' (' + tagProgress + '% of tags complete)')
+        return state
+      }
+      
+      const tagChild = reversedChildren[childIdx]
+      
       if (changeCount >= SAVE_THRESHOLD) {
-        doc = saveAndReopenDoc_(doc)
+        doc.saveAndClose()
+        doc = DocumentApp.openById(doc.getId())
+        body = doc.getBody()
         changeCount = 0
       }
-      const p = doc.getBody().appendParagraph('')
+      
+      const p = body.appendParagraph('')
       const dateText = p.appendText(tagChild.date)
 
       // a new heading won't always show up on the first API call since the named range was just added
@@ -186,22 +586,51 @@ function findTagsAndBuildIndex() {
 
       dateText.setBold(true)
       tagChild.elements.forEach(child => {
-        switch (child.getType()) {
-          case DocumentApp.ElementType.INLINE_IMAGE:
-            doc.getBody().appendImage(child.copy())
-            break;
-          case DocumentApp.ElementType.PARAGRAPH:
-          case DocumentApp.ElementType.LIST_ITEM:
-            const truncated = truncateText_(child.copy().getText().replace(TAGS_REGEX, ''), MAX_CHARS_PER_ENTRY)
-            child.getType() === DocumentApp.ElementType.PARAGRAPH ?
-              doc.getBody().appendParagraph(truncated) :
-              doc.getBody().appendListItem(truncated)
-            break;
+        // Handle both regular Document elements and deserialized elements
+        const isDeserialized = child.serializedType !== undefined
+        
+        if (isDeserialized) {
+          // Element was loaded from state - use serialized data
+          if (child.serializedType === 'INLINE_IMAGE') {
+            if (child.imageBlob) {
+              const imageBlob = Utilities.newBlob(Utilities.base64Decode(child.imageBlob))
+              const image = body.appendImage(imageBlob)
+              if (child.imageWidth) image.setWidth(child.imageWidth)
+              if (child.imageHeight) image.setHeight(child.imageHeight)
+            }
+          } else {
+            const truncated = truncateText_(child.text.replace(TAGS_REGEX, ''), MAX_CHARS_PER_ENTRY)
+            if (child.serializedType === 'LIST_ITEM') {
+              body.appendListItem(truncated)
+            } else {
+              body.appendParagraph(truncated)
+            }
+          }
+        } else {
+          // Element is from current gathering - use Document API
+          switch (child.getType()) {
+            case DocumentApp.ElementType.INLINE_IMAGE:
+              body.appendImage(child.copy())
+              break;
+            case DocumentApp.ElementType.PARAGRAPH:
+            case DocumentApp.ElementType.LIST_ITEM:
+              const truncated = truncateText_(child.copy().getText().replace(TAGS_REGEX, ''), MAX_CHARS_PER_ENTRY)
+              child.getType() === DocumentApp.ElementType.PARAGRAPH ?
+                body.appendParagraph(truncated) :
+                body.appendListItem(truncated)
+              break;
+          }
         }
       })
-      doc.getBody().appendParagraph('')
+      body.appendParagraph('')
       changeCount += tagChild.elements.length + 2 // Approximate change count
-    })
-  })
-  doc.saveAndClose()
+    }
+    
+    // Reset child index for the next tag
+    state.currentTagChildIndex = 0
+  }
+  
+  // Writing phase complete
+  state.phase = 'complete'
+  return state
 }
